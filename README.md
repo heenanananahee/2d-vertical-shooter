@@ -1,5 +1,7 @@
 # 2D Vertical Shooter
 
+[Korean version (README.ko.md)](README.ko.md)
+
 A Unity 2D vertical shooter prototype project.
 
 This repository contains a playable sample scene where the player can move, shoot, and defeat spawning enemies. The current implementation focuses on core gameplay loop setup (movement, shooting, enemy spawn, hit detection, and basic feedback) and project configuration for Unity 6 + URP.
