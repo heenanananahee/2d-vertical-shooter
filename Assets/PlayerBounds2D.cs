@@ -2,6 +2,8 @@ using UnityEngine;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 #endif
+using System.Collections.Generic;
+using System.Text.RegularExpressions;
 
 [RequireComponent(typeof(Rigidbody2D))]
 public class PlayerBounds2D : MonoBehaviour
@@ -422,23 +424,33 @@ public class EnemyHurtboxRelay2D : MonoBehaviour
 
 public class EnemyUnit2D : MonoBehaviour
 {
-    [SerializeField] private float fallSpeed = 2.5f;
+    [SerializeField] private float fallSpeed = 1.2f;
     [SerializeField] private float destroyY = -7f;
     [SerializeField] private Vector2 fallbackBoxSize = new Vector2(0.6f, 0.6f);
     [SerializeField] private int maxHealth = 3;
     [SerializeField] private float hitEffectLifetime = 0.2f;
+    [SerializeField] private bool verboseHitLogs = false;
+    [SerializeField] private bool debugHitValidationLogs = true;
 
     private bool _killed;
     private int _health;
     private GameObject _lastBulletObject;
     private int _lastHitFrame = -1;
+    private GameObject _hitOverlayTemplate;
     private GameObject _hitOverlayInstance;
     private float _hitOverlayHideAt = -1f;
+    private GameObject _assignedHitTemplate;
+    private string _resolvedEnemyType;
 
     private void Awake()
     {
-        _health = Mathf.Max(1, maxHealth);
+        _resolvedEnemyType = ExtractEnemyType(gameObject.name);
+        _health = Mathf.Max(1, GetInitialHealthByEnemyType());
         SetupHurtboxes();
+    }
+
+    private void Start()
+    {
         SetupHitOverlay();
     }
 
@@ -455,6 +467,19 @@ public class EnemyUnit2D : MonoBehaviour
             }
         }
         if (transform.position.y < destroyY) Destroy(gameObject);
+    }
+
+    public void SetFallSpeed(float speed)
+    {
+        fallSpeed = Mathf.Max(0.1f, speed);
+    }
+
+    public void ConfigureFromSpawner(float speed, GameObject hitTemplate, string enemyType)
+    {
+        SetFallSpeed(speed);
+        if (!string.IsNullOrEmpty(enemyType)) _resolvedEnemyType = enemyType;
+        if (hitTemplate != null) _assignedHitTemplate = hitTemplate;
+        _health = Mathf.Max(1, GetInitialHealthByEnemyType());
     }
 
     /// <summary>모든(루트+자식) Collider2D에 트리거 + 히트 전달. 자식 콜라이더 가장자리맞이도 먹히게 합니다.</summary>
@@ -511,33 +536,158 @@ public class EnemyUnit2D : MonoBehaviour
         Destroy(bulletObject);
 
         _health--;
-        ShowHitOverlay();
-        if (_health > 0) return;
+        if (verboseHitLogs) Debug.Log("Enemy hit: " + gameObject.name + ", type=" + _resolvedEnemyType + ", remaining hp=" + _health, this);
+        if (_health > 0)
+        {
+            ShowHitOverlay();
+            return;
+        }
 
         _killed = true;
+        SpawnDetachedHitOverlay();
+        // Hide immediately to avoid one-frame "freeze" look before Destroy is processed.
+        gameObject.SetActive(false);
         Destroy(gameObject);
     }
 
     private void SetupHitOverlay()
     {
-        GameObject template = FindHitTemplateForEnemyName(gameObject.name);
-        if (template == null) return;
-        _hitOverlayInstance = Instantiate(template, transform);
-        _hitOverlayInstance.name = template.name + "_Overlay";
-        _hitOverlayInstance.transform.localPosition = Vector3.zero;
-        _hitOverlayInstance.transform.localRotation = Quaternion.identity;
-        _hitOverlayInstance.transform.localScale = Vector3.one;
-        StripGameplayComponents(_hitOverlayInstance);
-        _hitOverlayInstance.SetActive(false);
+        GameObject template = _assignedHitTemplate;
+        string debugInfo = "";
+        if (template == null)
+        {
+            template = FindHitTemplateForEnemyName(gameObject.name, out debugInfo);
+        }
+        if (template == null)
+        {
+            Debug.LogWarning("Hit overlay template not found for enemy '" + gameObject.name + "'. " + debugInfo, this);
+            return;
+        }
+        _hitOverlayTemplate = template;
+        if (_hitOverlayInstance == null)
+        {
+            _hitOverlayInstance = Instantiate(_hitOverlayTemplate, transform);
+            _hitOverlayInstance.name = _hitOverlayTemplate.name + "_AttachedFx";
+            _hitOverlayInstance.transform.localPosition = Vector3.zero;
+            _hitOverlayInstance.transform.localRotation = Quaternion.identity;
+            _hitOverlayInstance.transform.localScale = Vector3.one;
+            PrepareHitFxVisualOnly(_hitOverlayInstance);
+            _hitOverlayInstance.SetActive(false);
+        }
+        if (debugHitValidationLogs)
+        {
+            Debug.Log("Hit template resolved for enemy '" + gameObject.name + "' => '" + _hitOverlayTemplate.name + "'.", this);
+        }
     }
 
     private void ShowHitOverlay()
     {
-        if (_hitOverlayInstance == null) return;
-        _hitOverlayInstance.transform.localPosition = Vector3.zero;
-        _hitOverlayInstance.transform.localRotation = Quaternion.identity;
+        if (_hitOverlayInstance == null)
+        {
+            SetupHitOverlay();
+            if (_hitOverlayInstance == null) return;
+        }
+        _hitOverlayInstance.transform.SetLocalPositionAndRotation(Vector3.zero, Quaternion.identity);
         _hitOverlayInstance.SetActive(true);
         _hitOverlayHideAt = Time.time + Mathf.Max(0.02f, hitEffectLifetime);
+    }
+
+    private void SpawnDetachedHitOverlay()
+    {
+        if (_hitOverlayTemplate == null) return;
+
+        Vector3 spawnPos = GetHitFxSpawnPosition();
+        Quaternion spawnRot = transform.rotation;
+        GameObject detached = Instantiate(_hitOverlayTemplate, spawnPos, spawnRot);
+        detached.name = _hitOverlayTemplate.name + "_HitFx";
+        detached.transform.SetParent(null, true);
+        // Keep VFX aligned to enemy scale so left/right flip or scaling does not distort hit effect.
+        detached.transform.localScale = transform.lossyScale;
+        PrepareHitFxVisualOnly(detached);
+        detached.SetActive(true);
+
+        TimedDestroy2D timer = detached.GetComponent<TimedDestroy2D>();
+        if (timer == null) timer = detached.AddComponent<TimedDestroy2D>();
+        timer.SetLifetime(Mathf.Max(0.02f, hitEffectLifetime));
+
+        HitFxDrift2D drift = detached.GetComponent<HitFxDrift2D>();
+        if (drift == null) drift = detached.AddComponent<HitFxDrift2D>();
+        drift.SetVelocity(Vector3.down * fallSpeed);
+
+        if (verboseHitLogs)
+        {
+            Debug.Log(
+                "Spawn hit VFX: enemy='" + gameObject.name +
+                "', template='" + _hitOverlayTemplate.name +
+                "', pos=" + spawnPos +
+                ", scale=" + detached.transform.localScale + ".",
+                this
+            );
+        }
+    }
+
+    private Vector3 GetHitFxSpawnPosition()
+    {
+        SpriteRenderer sr = GetComponentInChildren<SpriteRenderer>(true);
+        if (sr != null) return sr.bounds.center;
+        return transform.position;
+    }
+
+    private void PrepareHitFxVisualOnly(GameObject fxRoot)
+    {
+        if (fxRoot == null) return;
+
+        // Disable gameplay scripts immediately so hit-fx cannot move/fall/collide for even one frame.
+        Behaviour[] behaviours = fxRoot.GetComponentsInChildren<Behaviour>(true);
+        for (int i = 0; i < behaviours.Length; i++)
+        {
+            Behaviour b = behaviours[i];
+            if (b == null) continue;
+            if (b is SpriteRenderer) continue;
+            if (b is Animator) continue; // keep animation if template has one
+            if (b is TimedDestroy2D) continue;
+            b.enabled = false;
+        }
+
+        Collider2D[] cols = fxRoot.GetComponentsInChildren<Collider2D>(true);
+        for (int i = 0; i < cols.Length; i++)
+        {
+            if (cols[i] == null) continue;
+            cols[i].enabled = false;
+        }
+
+        Rigidbody2D[] rbs = fxRoot.GetComponentsInChildren<Rigidbody2D>(true);
+        for (int i = 0; i < rbs.Length; i++)
+        {
+            Rigidbody2D rb = rbs[i];
+            if (rb == null) continue;
+            rb.linearVelocity = Vector2.zero;
+            rb.angularVelocity = 0f;
+            rb.simulated = false;
+        }
+
+        // Keep hit-fx visible over enemy body.
+        int topOrder = FindTopEnemySortingOrder();
+        SpriteRenderer[] fxRenderers = fxRoot.GetComponentsInChildren<SpriteRenderer>(true);
+        for (int i = 0; i < fxRenderers.Length; i++)
+        {
+            SpriteRenderer r = fxRenderers[i];
+            if (r == null) continue;
+            r.sortingOrder = topOrder + 2;
+        }
+    }
+
+    private int FindTopEnemySortingOrder()
+    {
+        SpriteRenderer[] enemyRenderers = GetComponentsInChildren<SpriteRenderer>(true);
+        int maxOrder = 0;
+        for (int i = 0; i < enemyRenderers.Length; i++)
+        {
+            SpriteRenderer r = enemyRenderers[i];
+            if (r == null) continue;
+            if (i == 0 || r.sortingOrder > maxOrder) maxOrder = r.sortingOrder;
+        }
+        return maxOrder;
     }
 
     private void StripGameplayComponents(GameObject root)
@@ -571,34 +721,104 @@ public class EnemyUnit2D : MonoBehaviour
         }
     }
 
-    private static GameObject FindHitTemplateForEnemyName(string enemyObjectName)
+    private static GameObject FindHitTemplateForEnemyName(string enemyObjectName, out string debugInfo)
     {
         string type = ExtractEnemyType(enemyObjectName);
-        if (string.IsNullOrEmpty(type)) return null;
+        if (string.IsNullOrEmpty(type))
+        {
+            debugInfo = "Could not extract enemy type from name.";
+            return null;
+        }
 
-        string exact1 = ("enenmy " + type + " hit").ToLowerInvariant();
-        string exact2 = ("enemy " + type + " hit").ToLowerInvariant();
+        string exact1 = NormalizeNameForLookup("enenmy " + type + " hit");
+        string exact2 = NormalizeNameForLookup("enemy " + type + " hit");
+        string exact3 = NormalizeNameForLookup(type + " hit");
+        string typeToken = type.ToLowerInvariant();
 
         GameObject[] allObjects = Resources.FindObjectsOfTypeAll<GameObject>();
+        GameObject best = null;
+        int bestScore = int.MinValue;
+        List<string> sampleCandidates = new List<string>();
         for (int i = 0; i < allObjects.Length; i++)
         {
             GameObject go = allObjects[i];
             if (go == null) continue;
-            if (!go.scene.IsValid()) continue;
-            string n = go.name.ToLowerInvariant().Trim();
-            if (n == exact1 || n == exact2) return go;
+            if (go.GetComponentInParent<EnemyUnit2D>() != null) continue; // ignore runtime enemy descendants
+
+            string n = NormalizeNameForLookup(go.name);
+            bool candidateLike = n.Contains("hit") || Regex.IsMatch(n, @"\b" + typeToken + @"\b");
+            if (candidateLike && sampleCandidates.Count < 8)
+            {
+                sampleCandidates.Add(go.name + (go.scene.IsValid() ? " [scene]" : " [asset]"));
+            }
+
+            int score = ScoreHitTemplateCandidate(n, typeToken, exact1, exact2, exact3, go.scene.IsValid());
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = go;
+            }
         }
+
+        if (best != null && bestScore >= 40)
+        {
+            debugInfo = "Selected template: '" + best.name + "' (score " + bestScore + ").";
+            return best;
+        }
+
+        string candidateText = sampleCandidates.Count > 0 ? string.Join(", ", sampleCandidates.ToArray()) : "none";
+        debugInfo = "Type=" + type + ", bestScore=" + bestScore + ", sampled candidates: " + candidateText;
         return null;
     }
 
-    private static string ExtractEnemyType(string enemyObjectName)
+    public static string ExtractEnemyType(string enemyObjectName)
     {
         if (string.IsNullOrEmpty(enemyObjectName)) return "";
-        string n = enemyObjectName.ToLowerInvariant();
+        string n = NormalizeNameForLookup(enemyObjectName);
         if (n.Contains("enemy a") || n.Contains("enenmy a")) return "A";
         if (n.Contains("enemy b") || n.Contains("enenmy b")) return "B";
         if (n.Contains("enemy c") || n.Contains("enenmy c")) return "C";
+        // Support short names like A, B, C and clone variants like A(Clone), enemy_a(Clone)
+        if (Regex.IsMatch(n, @"\ba\b")) return "A";
+        if (Regex.IsMatch(n, @"\bb\b")) return "B";
+        if (Regex.IsMatch(n, @"\bc\b")) return "C";
         return "";
+    }
+
+    private static string NormalizeNameForLookup(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        string n = raw.ToLowerInvariant().Trim();
+        n = n.Replace("(clone)", "");
+        n = n.Replace("_", " ").Replace("-", " ");
+        n = Regex.Replace(n, @"\s+", " ").Trim();
+        return n;
+    }
+
+    private static int ScoreHitTemplateCandidate(string normalizedName, string typeToken, string exact1, string exact2, string exact3, bool isSceneObject)
+    {
+        if (string.IsNullOrEmpty(normalizedName)) return int.MinValue;
+
+        int score = int.MinValue;
+        if (normalizedName == exact1 || normalizedName == exact2) score = 120;
+        else if (normalizedName == exact3) score = 110;
+        else if ((normalizedName.Contains("enemy " + typeToken) || normalizedName.Contains("enenmy " + typeToken)) && normalizedName.Contains("hit")) score = 90;
+        else if (normalizedName.Contains("hit") && Regex.IsMatch(normalizedName, @"\b" + typeToken + @"\b")) score = 70;
+        else if (Regex.IsMatch(normalizedName, @"\b" + typeToken + @"\b")) score = 20;
+        else return int.MinValue;
+
+        // Prefer prefab/assets or inactive templates over random scene objects with similar names.
+        if (!isSceneObject) score += 5;
+        return score;
+    }
+
+    private int GetInitialHealthByEnemyType()
+    {
+        int baseHealth = Mathf.Max(1, maxHealth);
+        string type = string.IsNullOrEmpty(_resolvedEnemyType) ? ExtractEnemyType(gameObject.name) : _resolvedEnemyType;
+        if (type == "B") return baseHealth * 2;
+        if (type == "C") return baseHealth * 3;
+        return baseHealth; // A or unknown: keep original health
     }
 }
 
@@ -623,16 +843,40 @@ public class TimedDestroy2D : MonoBehaviour
     }
 }
 
+public class HitFxDrift2D : MonoBehaviour
+{
+    private Vector3 _velocity = Vector3.zero;
+
+    public void SetVelocity(Vector3 velocity)
+    {
+        _velocity = velocity;
+    }
+
+    private void Update()
+    {
+        if (_velocity == Vector3.zero) return;
+        transform.position += _velocity * Time.deltaTime;
+    }
+}
+
 public class EnemySpawner2D : MonoBehaviour
 {
     [SerializeField] private GameObject[] enemyPrefabs;
     [SerializeField] private Camera targetCamera;
-    [SerializeField] private Vector2 spawnIntervalRange = new Vector2(0.6f, 1.2f);
+    [SerializeField] private Vector2 spawnIntervalRange = new Vector2(1.4f, 2.1f);
     [SerializeField] private float spawnTopPadding = 0.8f;
     [Tooltip("씬에 직접 둔 적(스폰에 쓰는 복제 원본)은 제외. 그 외 같은 이름의 적에만 떨어짐/피격 로직을 붙입니다.")]
-    [SerializeField] private bool autoMoveSceneEnemies = true;
+    [SerializeField] private bool autoMoveSceneEnemies = false;
     [Tooltip("시작 시 씬에 올려둔 Enemy/HIT 템플릿을 자동으로 비활성화합니다.")]
     [SerializeField] private bool hideSceneTemplatesOnStart = true;
+    [Header("Enemy Tuning")]
+    [SerializeField] private float enemyFallSpeed = 1.2f;
+    [SerializeField] private int maxAliveEnemies = 6;
+    [Header("Hit Templates (recommended explicit binding)")]
+    [SerializeField] private GameObject enemyAHitTemplate;
+    [SerializeField] private GameObject enemyBHitTemplate;
+    [SerializeField] private GameObject enemyCHitTemplate;
+    [SerializeField] private bool logHitTemplateValidation = true;
 
     private float nextSpawnTime;
     private bool templatesPrepared;
@@ -643,6 +887,8 @@ public class EnemySpawner2D : MonoBehaviour
     {
         if (targetCamera == null) targetCamera = Camera.main;
         if (enemyPrefabs == null || enemyPrefabs.Length == 0) enemyPrefabs = FindEnemySpawnSources();
+        AutoAssignHitTemplatesIfMissing();
+        ValidateHitTemplateBindings();
         TryPrepareAndAttachForScene();
         ScheduleNext();
     }
@@ -662,6 +908,8 @@ public class EnemySpawner2D : MonoBehaviour
 
     private void SpawnEnemy()
     {
+        if (CountAliveEnemies() >= Mathf.Max(1, maxAliveEnemies)) return;
+
         GameObject prefab = enemyPrefabs[Random.Range(0, enemyPrefabs.Length)];
         if (prefab == null) return;
 
@@ -669,7 +917,21 @@ public class EnemySpawner2D : MonoBehaviour
         Vector3 spawnPos = new Vector3(Random.Range(minX, maxX), topY + spawnTopPadding, 0f);
         GameObject enemy = Instantiate(prefab, spawnPos, Quaternion.identity);
         enemy.SetActive(true);
-        if (enemy.GetComponent<EnemyUnit2D>() == null) enemy.AddComponent<EnemyUnit2D>();
+        EnemyUnit2D unit = enemy.GetComponent<EnemyUnit2D>();
+        if (unit == null) unit = enemy.AddComponent<EnemyUnit2D>();
+        string type = EnemyUnit2D.ExtractEnemyType(enemy.name);
+        unit.ConfigureFromSpawner(enemyFallSpeed, GetHitTemplateByType(type), type);
+    }
+
+    private int CountAliveEnemies()
+    {
+        EnemyUnit2D[] units = FindObjectsOfType<EnemyUnit2D>();
+        int count = 0;
+        for (int i = 0; i < units.Length; i++)
+        {
+            if (units[i] != null && units[i].gameObject.activeInHierarchy) count++;
+        }
+        return count;
     }
 
     private void GetCameraTopRange(out float minX, out float maxX, out float topY)
@@ -775,8 +1037,59 @@ public class EnemySpawner2D : MonoBehaviour
             GameObject c = candidates[i];
             if (c == null) continue;
             if (IsSpawnSourceReference(c)) continue;
-            if (c.GetComponent<EnemyUnit2D>() == null) c.AddComponent<EnemyUnit2D>();
+            EnemyUnit2D unit = c.GetComponent<EnemyUnit2D>();
+            if (unit == null) unit = c.AddComponent<EnemyUnit2D>();
+            string type = EnemyUnit2D.ExtractEnemyType(c.name);
+            unit.ConfigureFromSpawner(enemyFallSpeed, GetHitTemplateByType(type), type);
         }
+    }
+
+    private GameObject GetHitTemplateByType(string type)
+    {
+        if (type == "A") return enemyAHitTemplate;
+        if (type == "B") return enemyBHitTemplate;
+        if (type == "C") return enemyCHitTemplate;
+        return null;
+    }
+
+    private void ValidateHitTemplateBindings()
+    {
+        if (!logHitTemplateValidation) return;
+        if (enemyAHitTemplate == null) Debug.LogWarning("Enemy A hit template is not assigned.", this);
+        if (enemyBHitTemplate == null) Debug.LogWarning("Enemy B hit template is not assigned.", this);
+        if (enemyCHitTemplate == null) Debug.LogWarning("Enemy C hit template is not assigned.", this);
+    }
+
+    private void AutoAssignHitTemplatesIfMissing()
+    {
+        if (enemyAHitTemplate == null) enemyAHitTemplate = FindHitTemplateInSceneOrAssets("a");
+        if (enemyBHitTemplate == null) enemyBHitTemplate = FindHitTemplateInSceneOrAssets("b");
+        if (enemyCHitTemplate == null) enemyCHitTemplate = FindHitTemplateInSceneOrAssets("c");
+    }
+
+    private GameObject FindHitTemplateInSceneOrAssets(string typeToken)
+    {
+        GameObject[] allObjects = Resources.FindObjectsOfTypeAll<GameObject>();
+        for (int i = 0; i < allObjects.Length; i++)
+        {
+            GameObject go = allObjects[i];
+            if (go == null) continue;
+            string n = NormalizeForTemplateLookup(go.name);
+            if (!n.Contains("hit")) continue;
+            if (!Regex.IsMatch(n, @"\b" + typeToken + @"\b")) continue;
+            return go;
+        }
+        return null;
+    }
+
+    private static string NormalizeForTemplateLookup(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return "";
+        string n = raw.ToLowerInvariant().Trim();
+        n = n.Replace("(clone)", "");
+        n = n.Replace("_", " ").Replace("-", " ");
+        n = Regex.Replace(n, @"\s+", " ").Trim();
+        return n;
     }
 
     private GameObject[] FindEnemySpawnSources()
